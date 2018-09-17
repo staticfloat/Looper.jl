@@ -5,6 +5,7 @@ This package was born out of a desire to play around with loop tiling and unroll
 It turns out, as long as you don't mind creating tools to rapidly shoot yourself in the foot, you can make decent progress.  This package has no problem altering your loops in such a way as to cause strange and undefined behavior.  It works by parsing loops into a kind of interemdiate representation (the `Looper.Loop` type) via the `@looper` macro:
 
 ```julia
+using Looper
 l = @looper for idx in 1:length(x)
     x[idx] = x[idx].^2
 end
@@ -39,6 +40,7 @@ This causes all loops within `l` that use the index variable `x` to be unrolled 
 This one taken straight from [the tests](test/runtests.jl):
 
 ```julia
+using Looper
 l = @looper for x in 1:size(touchstone, 1)
     for y in 1:size(touchstone, 2)
         touchstone[x, y] = touch_count
@@ -53,6 +55,7 @@ func = instantiate(lc; verbose=true)
 This makes use of a few things; it demonstrats that you can have arbitrarily-nested `for` loops with a single `@looper` macro, it shows that you can compose loop transformations (such as a `tile()` followed by an `unroll()`, using the implicitly-created `y_inner` loop index) and it shows that there is a `verbose` keyword argument to `instantiate()` that lets you inspect the generated Julia code before it gets handed off to LLVM.  Running this instantiated code is similar to all previous examples:
 
 ```julia
+using Test
 touchstone = zeros(Int64, 5, 5)
 func(touchstone=touchstone, touch_count=0)
 
