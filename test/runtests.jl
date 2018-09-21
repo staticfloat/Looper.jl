@@ -77,66 +77,55 @@ end
     end
 end
 
-@testset "Argument Detection" begin
-    # Test that we can figure out when we're referencing something
-    # defined outside of the loop.
-    x_out = [1.0,2.0,3.0,4.0]
-    alpha = 1.5
-    N = length(x_out)
-    l = @looper for idx in 1:N
-        x_out[idx] *= 2*alpha
-        alpha += idx
-    end
-
-    args = Looper.unknown_args(l)
-    @test length(args) == 3
-    @test :x_out in args
-    @test :alpha in args
-    @test :N in args
-end
-
-
 @testset "Loop instantiation" begin
     # Test simple loop storage
-    x_out = Int64[]
     l = @looper for x in 1:10
         push!(x_out, x*x)
     end
-    func = instantiate(l)
-    func(x_out = x_out)
-    @test x_out == collect(1:10).^2
+    @eval function simple()
+        x_out = Int64[]
+        $(instantiate(l))
+        return x_out
+    end
+    @test simple() == collect(1:10).^2
 
     # Test more complex double-loop storage
-    x_out = zeros(Int64, 10, 10)
     l = @looper for xidx in 1:10, yidx in 1:10
         z = (xidx - yidx).^2
         x_out[xidx, yidx] = z
     end
-    func = instantiate(l)
-    func(x_out = x_out)
-    @test x_out == ((0:9) .- collect(0:9)').^2
+    @eval function double_loop(x_out)
+        $(instantiate(l))
+        return x_out
+    end
+    @test double_loop(zeros(Int64, 10, 10)) == ((0:9) .- collect(0:9)').^2
 
     # Test index manipulation
-    x_in = 1:100
-    x_out = zeros(Int64, 100)
     l = @looper for idx in 2:99
         x_slice = x_in[idx-1:idx+1]
         x_out[idx] = (minimum(x_slice) + maximum(x_slice))/2.0
     end
-    func = instantiate(l)
-    func(x_out = x_out, x_in = x_in)
-    @test x_out == [0, 2:99..., 0]
+    @eval function index_manipulation(x_in)
+        x_out = zeros(Int64, length(x_in))
+        $(instantiate(l))
+        return x_out
+    end
+    @test index_manipulation(1:100) == [0, 2:99..., 0]
 end
 
 @testset "Loop Unrolling" begin
-    x_out = Ref(0)
     l = @looper for x in 1:10
-        x_out[] += x
+        x_out += x
+    end
+
+    @eval function simple()
+        x_out = 0
+        $(instantiate(l))
+        return x_out
     end
 
     # Unroll `l` by a factor of 3 along `x`
     l_unrolled = unroll(l, :x, 3)
-    func = instantiate(l_unrolled)
 
     # Test that this lowers to two loops, one with three statements in
     # the body, the other with one statement in the body.
@@ -144,34 +133,40 @@ end
     @test length(l_unrolled[1].body) == 3
     @test length(l_unrolled[2].body) == 1
 
+    @eval function unrolled()
+        x_out = 0
+        $(instantiate(l_unrolled))
+        return x_out
+    end
+
     # Test that actually executing this loop calculates the same thing as
     # an unrolled variant.
-    x_out = Ref(0)
-    instantiate(l)(x_out = x_out)
-    @test x_out[] == sum(1:10)
-
-    x_out = Ref(0)
-    instantiate(l_unrolled)(x_out = x_out)
-    @test x_out[] == sum(1:10)
+    @test unrolled() == sum(1:10)
 
     # Next, unroll `l` by a factor of 5 along `x`, eliding any tail
     l_unrolled5 = unroll(l, :x, 5; no_tails=true)
+    @eval function unrolled5()
+        x_out = 0
+        $(instantiate(l_unrolled5))
+        return x_out
+    end
     
     # Test that this lowers to one loop with five statements
     @test length(l_unrolled5) == 1
     @test length(l_unrolled5[1].body) == 5
 
     # Test that it works
-    x_out = Ref(0)
-    instantiate(l_unrolled5)(x_out = x_out)
-    @test x_out[] == sum(1:10)
+    @test unrolled5() == sum(1:10)
 
     # Next, unroll by a factor of 6 and test that it calculates the wrong result:
     l_unrolled6 = unroll(l, :x, 6; no_tails=true)
-    x_out = Ref(0)
-    instantiate(l_unrolled6)(x_out = x_out)
-    @test x_out[] != sum(1:10)
-    @test x_out[] == sum(1:6)
+    @eval function unrolled6()
+        x_out = 0
+        $(instantiate(l_unrolled6))
+        return x_out
+    end
+    @test unrolled6() != sum(1:10)
+    @test unrolled6() == sum(1:6)
 end
 
 @testset "Loop Transposition" begin
@@ -184,13 +179,22 @@ end
         end
 
         # Run it normally 
-        touchstone = zeros(Int64, 10, 10)
-        instantiate(l)(touchstone = touchstone, touch_count = 0)
+        @eval function vanilla()
+            touch_count = 0
+            touchstone = zeros(Int64, 10, 10)
+            $(instantiate(l))
+            return touchstone
+        end
 
-        # Next, run it transpose
-        touchstone_t = zeros(Int64, 10, 10)
-        lp = transpose(l, :x, :y)
-        instantiate(lp)(touchstone = touchstone_t, touch_count = 0)
+        @eval function transposed()
+            touch_count = 0
+            touchstone = zeros(Int64, 10, 10)
+            $(instantiate(transpose(l, :x, :y)))
+            return touchstone
+        end
+
+        touchstone = vanilla()
+        touchstone_t = transposed()
 
         # Make sure the permutation actually happened
         @test touchstone == touchstone_t'
@@ -198,18 +202,22 @@ end
 
     @testset "Innocent Bystander" begin
         # Make sure that transposing x and z within a loop nest of [z, y, x] leaves y alone
-        l = @looper for x in 1:4, y in 1:4, z in 1:4
+        l = @looper for x in 1:size(touchstone,3),
+                        y in 1:size(touchstone,2),
+                        z in 1:size(touchstone,1)
             touchstone[z, y, x] = touch_count
             touch_count += 1
         end
 
         # Run it permuted
-        touchstone = zeros(Int64, 4, 4, 4)
-        lp = transpose(l, :x, :z)
-        instantiate(lp)(touchstone = touchstone, touch_count = 0)
+        @eval function innocent_bystander(touchstone)
+            touch_count = 0
+            $(instantiate(transpose(l, :x, :z)))
+            return touchstone
+        end
 
         # Test that the permutation worked
-        @test touchstone == permutedims(reshape(0:63, (4, 4, 4)), (3,2,1))
+        @test innocent_bystander(zeros(Int64, 4, 4, 4)) == permutedims(reshape(0:63, (4, 4, 4)), (3,2,1))
     end
 end
 
@@ -222,10 +230,12 @@ end
     end
 
     # Tile this in x/y in blocks of 2
-    func = instantiate(tile(l, :x, :y, 2, 2))
-    touchstone = zeros(Int64, 5, 5)
-    func(touchstone=touchstone, touch_count = 0)
-    @test touchstone == [
+    @eval function tile_xy22(touchstone)
+        touch_count = 0
+        $(instantiate(tile(l, :x, :y, 2, 2)))
+        return touchstone
+    end
+    @test tile_xy22(zeros(Int64, 5, 5)) == [
         0   1   4   5   8;
         2   3   6   7   9;
        10  11  14  15  18;
@@ -234,17 +244,21 @@ end
     ]
 
     # Tile this in y/x in blocks of 2
-    func = instantiate(tile(l, :y, :x, 2, 2))
-    touchstone_t = zeros(Int64, 5, 5)
-    func(touchstone=touchstone_t, touch_count = 0)
-    @test touchstone == touchstone_t'
+    @eval function tile_yx22(touchstone)
+        touch_count = 0
+        $(instantiate(tile(l, :y, :x, 2, 2)))
+        return touchstone
+    end
+    @test tile_yx22(zeros(Int64, 5, 5)) == tile_xy22(zeros(Int64, 5, 5))'
 
 
     # Tile in 2x3 blocks on a non-square matrix
-    func = instantiate(tile(l, :x, :y, 2, 3))
-    touchstone = zeros(Int64, 5, 7)
-    func(touchstone=touchstone, touch_count = 0)
-    @test touchstone == [
+    @eval function tile_xy23(touchstone)
+        touch_count = 0
+        $(instantiate(tile(l, :x, :y, 2, 3)))
+        return touchstone
+    end
+    @test tile_xy23(zeros(Int64, 5, 7)) == [
         0   1   2   6   7   8  12;
         3   4   5   9  10  11  13;
        14  15  16  20  21  22  26;
@@ -269,11 +283,12 @@ end
     # Test we are fully unrolled
     @test length(lc[1].body[1].body[1].body[1].body) == 4
 
-    func = instantiate(lc)
-    touchstone = zeros(Int64, 5, 5)
-    func(touchstone=touchstone, touch_count = 0)
-
-    @test touchstone == [
+    @eval function big_daddy(touchstone)
+        touch_count = 0
+        $(instantiate(lc))
+        return touchstone
+    end
+    @test big_daddy(zeros(Int64, 5, 5)) == [
         0   1   2   3  16;
         4   5   6   7  17;
         8   9  10  11  18;

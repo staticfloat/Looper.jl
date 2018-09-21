@@ -49,31 +49,6 @@ function build_loops(l::Loop)
     end
 end
 
-# Loops that have bodies with external references (e.g. symbols that aren't
-# any previously-defined indices and aren't in the global scope) need to
-# have those values defined.
-function unknown_args(l::Loop)
-    args = Symbol[]
-    loop_indices = Any[]
-    prewalk(x -> begin
-        if isa(x, Loop)
-            push!(loop_indices, x.idx)
-        elseif isa(x, Symbol) && Base.isidentifier(x) &&
-               !isdefined(@__MODULE__, x) && !(x in loop_indices)
-            push!(args, x)
-        end
-        return x
-    end, l)
-    return unique(args)
-end
-function unknown_args(ls::Vector)
-    args = Symbol[]
-    for l in ls
-        append!(args, unknown_args(l))
-    end
-    return unique(args)
-end
-
 """
     @loops
 
@@ -94,6 +69,8 @@ As well as condensed loops:
 
 The two constructions are equivalent.  However, note that the condensed format will
 parse only up to three indices per for loop at a time.  This is an arbitrary limit.
+
+See the docstring for `instantiate()` for what to do with `l` once it is captured.
 """
 macro looper(ex)
     return postwalk(
@@ -110,51 +87,37 @@ macro looper(ex)
 end
 
 """
-    instantiate(l::Loop; verbose::Bool = false)
+    instantiate(l::Loop; verbose::Bool = false, preoptimize::Bool = true)
 
 Helper function to lower a `Loop` down into normal Julia code.
 As an example, for the `Loop` object `l = Loop(:x, 1:10, :(println("\$(x)")))`,
 @instantiate(l) would result in something similar to:
 
-    () -> begin
-        for x in 1:10
-            println("\$(x)")
-        end
+    for x in 1:10
+        println("\$(x)")
     end
 
-This function also performs very rudimentary input variable analysis;
-any symbol used within the loop body that is not a loop index or defined
-in `Base` automatically gets created as a keyword argument within the function
-returned by `instantiate()`.  Example:
+The typical workflow for this package is to capture a loop with `@looper`,
+manipulate it via `unroll()`, `transpose()`, `tile()`, etc... and then finally
+call `instantiate()` within an `@eval`'ed function.  Full example:
 
-    x_out = Int64[]
-    l = @looper for x in 1:10
-        push!(x_out, x*x)
-    end
-    func = instantiate(l)
-
-The `func` object will now look something like:
-
-    (; x_out = nothing) -> begin
-        for x in 1:10
-            push!(x_out, x*x)
-        end
+    l = @looper for i in 1:size(x, 1),
+                    j in 1:size(x, 2)
+        total += x[j, i] * x[i, j]
     end
 
-And can be called via:
-
-    func(x_out = x_out)
+    @eval function unrolled_nonsense(x)
+        total = 0
+        \$(instantiate(unroll(l, :j, 4))
+        return total
+    end
 """
 function instantiate(l; verbose::Bool = false, preoptimize::Bool = true)
-    args = unknown_args(l)
-    if verbose
-        @show args
-    end
-    kwargs = [Expr(:kw, a, nothing) for a in args]
-
     if preoptimize
         # Lower constant loop definitions as much as possible
         l = lower_constant_ranges(l)
+        # Lower `first(a:b)` -> `a`, since it's so common in our code
+        l = lower_constant_firsts(l)
         # Eliminate dead loops
         l = eliminate_dead_loops(l)
     end
@@ -166,9 +129,7 @@ function instantiate(l; verbose::Bool = false, preoptimize::Bool = true)
     if verbose
         @show func_body
     end
-    return @eval (; $(kwargs...)) -> begin
-        $(func_body)
-    end
+    return func_body
 end
 
 function eliminate_dead_loops(l::Loop)
@@ -213,6 +174,22 @@ function lower_constant_ranges(l::Loop)
     end, l)
 end
 lower_constant_ranges(ls::Vector) = lower_constant_ranges.(ls)
+
+function lower_constant_firsts(l::Loop)
+    # We lower first(a:b) -> a, and first(a:b:c) -> a, but only
+    # if we can directly evalutate them.  Same calavier attitude
+    # as above.
+    postwalk(l -> begin
+        if @capture(l, first(a_:b_)) || @capture(l, first(a_:b_:c_))
+            try
+                return eval(a)
+            catch
+            end
+        end
+        return l
+    end, l)
+end
+lower_constant_firsts(ls::Vector) = lower_constant_firsts.(ls)
 
 
 """
@@ -267,8 +244,8 @@ function unroll(l::Loop, idx::Symbol, factor::Int; no_tails::Bool = false)
             # one to catch any remainder iterations needed, unless `no_tails` is
             # set to `true`, in which case we assume (potentially disastrously!)
             # that the unroll factor perfectly divides the loop domain.
-            unrolled_loop = Loop(l.idx, :(unroll_range($(l.range), $(factor))), unrolled_body)
-            tail = Loop(l.idx, :(unroll_range_tail($(l.range), $(factor))), l.body)
+            unrolled_loop = Loop(l.idx, :(Looper.unroll_range($(l.range), $(factor))), unrolled_body)
+            tail = Loop(l.idx, :(Looper.unroll_range_tail($(l.range), $(factor))), l.body)
             
             if no_tails
                 return [unrolled_loop]
@@ -401,13 +378,13 @@ function tile(l::Loop, x_var::Symbol, y_var::Symbol, x_size::Int, y_size::Int)
 
     return [
         # Loop over all columns by tile
-        Loop(x_outer, :(tile_range_outer($(x_loop.range), $(x_size))),
+        Loop(x_outer, :(Looper.tile_range_outer($(x_loop.range), $(x_size))),
             [
                 # Loop over all tiles within this column
-                Loop(y_outer, :(tile_range_outer($(y_loop.range), $(y_size))),
+                Loop(y_outer, :(Looper.tile_range_outer($(y_loop.range), $(y_size))),
                     # Fill out every element within this tile
-                    Loop(x_inner, :(tile_range_inner($(x_loop.range), $(x_size))),
-                        Loop(y_inner, :(tile_range_inner($(y_loop.range), $(y_size))),
+                    Loop(x_inner, :(Looper.tile_range_inner($(x_loop.range), $(x_size))),
+                        Loop(y_inner, :(Looper.tile_range_inner($(y_loop.range), $(y_size))),
                             # This is, ideally, the hottest part of the code
                             body,
                         )
@@ -417,9 +394,9 @@ function tile(l::Loop, x_var::Symbol, y_var::Symbol, x_size::Int, y_size::Int)
                 # compute the final (partial) tile within this column.  This also
                 # means we must constrain the inner loop ranges to compute a partial
                 # tile, rather than a full tile by using `tile_range_remainder()`
-                Loop(y_outer, :(last(tile_range_outer($(y_loop.range), $(y_size))) + $(y_size)),
-                    Loop(x_inner, :(tile_range_inner($(x_loop.range), $(x_size))),
-                        Loop(y_inner, :(tile_range_remainder($(y_loop.range), $(y_size))),
+                Loop(y_outer, :(last(Looper.tile_range_outer($(y_loop.range), $(y_size))) + $(y_size)),
+                    Loop(x_inner, :(Looper.tile_range_inner($(x_loop.range), $(x_size))),
+                        Loop(y_inner, :(Looper.tile_range_remainder($(y_loop.range), $(y_size))),
                             body,
                         )
                     )
@@ -428,20 +405,20 @@ function tile(l::Loop, x_var::Symbol, y_var::Symbol, x_size::Int, y_size::Int)
         ),
         # Having finished all full columns, we must next compute the final (partial)
         # tiles all along the last partial column.
-        Loop(x_outer, :(last(tile_range_outer($(x_loop.range), $(x_size))) + $(x_size)),
-            Loop(y_outer, :(tile_range_outer($(y_loop.range), $(y_size))),
-                Loop(x_inner, :(tile_range_remainder($(x_loop.range), $(x_size))),
-                    Loop(y_inner, :(tile_range_inner($(y_loop.range), $(y_size))),
+        Loop(x_outer, :(last(Looper.tile_range_outer($(x_loop.range), $(x_size))) + $(x_size)),
+            Loop(y_outer, :(Looper.tile_range_outer($(y_loop.range), $(y_size))),
+                Loop(x_inner, :(Looper.tile_range_remainder($(x_loop.range), $(x_size))),
+                    Loop(y_inner, :(Looper.tile_range_inner($(y_loop.range), $(y_size))),
                         body,
                     )
                 )
             )
         ),
         # And finally, the black-sheep tile which is restricted in both x and y
-        Loop(x_outer, :(last(tile_range_outer($(x_loop.range), $(x_size))) + $(x_size)),
-            Loop(y_outer, :(last(tile_range_outer($(y_loop.range), $(y_size))) + $(y_size)),
-                Loop(x_inner, :(tile_range_remainder($(x_loop.range), $(x_size))),
-                    Loop(y_inner, :(tile_range_remainder($(y_loop.range), $(y_size))),
+        Loop(x_outer, :(last(Looper.tile_range_outer($(x_loop.range), $(x_size))) + $(x_size)),
+            Loop(y_outer, :(last(Looper.tile_range_outer($(y_loop.range), $(y_size))) + $(y_size)),
+                Loop(x_inner, :(Looper.tile_range_remainder($(x_loop.range), $(x_size))),
+                    Loop(y_inner, :(Looper.tile_range_remainder($(y_loop.range), $(y_size))),
                         body,
                     )
                 )
