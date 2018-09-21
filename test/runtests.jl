@@ -138,7 +138,7 @@ end
     l_unrolled = unroll(l, :x, 3)
     func = instantiate(l_unrolled)
 
-    # Test that this unrolls to two loops, one with three statements in
+    # Test that this lowers to two loops, one with three statements in
     # the body, the other with one statement in the body.
     @test length(l_unrolled) == 2
     @test length(l_unrolled[1].body) == 3
@@ -153,6 +153,25 @@ end
     x_out = Ref(0)
     instantiate(l_unrolled)(x_out = x_out)
     @test x_out[] == sum(1:10)
+
+    # Next, unroll `l` by a factor of 5 along `x`, eliding any tail
+    l_unrolled5 = unroll(l, :x, 5; no_tails=true)
+    
+    # Test that this lowers to one loop with five statements
+    @test length(l_unrolled5) == 1
+    @test length(l_unrolled5[1].body) == 5
+
+    # Test that it works
+    x_out = Ref(0)
+    instantiate(l_unrolled5)(x_out = x_out)
+    @test x_out[] == sum(1:10)
+
+    # Next, unroll by a factor of 6 and test that it calculates the wrong result:
+    l_unrolled6 = unroll(l, :x, 6; no_tails=true)
+    x_out = Ref(0)
+    instantiate(l_unrolled6)(x_out = x_out)
+    @test x_out[] != sum(1:10)
+    @test x_out[] == sum(1:6)
 end
 
 @testset "Loop Transposition" begin

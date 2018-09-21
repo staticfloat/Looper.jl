@@ -254,7 +254,7 @@ involves constructing a loop that runs `1/factor` as many times, but
 contains `factor` many iterations manually instantiated within it, each
 shifted by `1:factor` amounts in the index being unrolled.
 """
-function unroll(l::Loop, idx::Symbol, factor::Int)
+function unroll(l::Loop, idx::Symbol, factor::Int; no_tails::Bool = false)
     return postwalk(l -> begin
         # If this loop index matches the one we're looking for
         if (isa(l, Loop) && l.idx == idx)
@@ -262,12 +262,19 @@ function unroll(l::Loop, idx::Symbol, factor::Int)
             unrolled_body = [
                 replace(l.body, l.idx, :(first($(l.range)) + $(l.idx) + $(offset))) for offset in 0:(factor - 1)
             ]
-            return [
-                # Replace this Loop with two; one for the unrolled loop and one
-                # to catch any remainder iterations needed.
-                Loop(l.idx, :(unroll_range($(l.range), $(factor))), unrolled_body),
-                Loop(l.idx, :(unroll_range_tail($(l.range), $(factor))), l.body),
-            ]
+            
+            # We replace this current Loop with two; one for the unrolled loop and
+            # one to catch any remainder iterations needed, unless `no_tails` is
+            # set to `true`, in which case we assume (potentially disastrously!)
+            # that the unroll factor perfectly divides the loop domain.
+            unrolled_loop = Loop(l.idx, :(unroll_range($(l.range), $(factor))), unrolled_body)
+            tail = Loop(l.idx, :(unroll_range_tail($(l.range), $(factor))), l.body)
+            
+            if no_tails
+                return [unrolled_loop]
+            else
+                return [unrolled_loop, tail]
+            end
         else
             return l
         end
