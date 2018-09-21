@@ -11,17 +11,12 @@ l = @looper for idx in 1:length(x)
 end
 ```
 
-The variable `l` is now a parsed representation of the `for` loop defined above.  To actually run the loop, you `instantiate()` the `Loop` type, which returns a closure:
+The variable `l` is now a parsed representation of the `for` loop defined above.  To actually run the loop, you `instantiate()` the `Loop` type wihin an `@eval`'ed function:
 
 ```julia
-f = instantiate(l)
-```
-
-However, note that the variable `x` has not been defined anywhere within this function.  To define it, we pass `x` in as a keyword argument to `f`, like so:
-
-```julia
-x = collect(1:10)
-f(;x=x)
+@eval function my_loop(x)
+    $(instantiate(l))
+end
 ```
 
 Inspecting the value of `x` shows that it is indeed the correct result.
@@ -29,8 +24,9 @@ Inspecting the value of `x` shows that it is indeed the correct result.
 "So what?", you object.  "You've invented a complex way of doing the exact same thing that I could otherwise have done without this package by just writing a naked `for` loop."  Indeed this is true, however it's what you can do to the `Loop` object between parsing and instantiation that really causes it to shine:
 
 ```julia
-l_unrolled = unroll(l, :x, 4)
-f_unrolled = instantiate(l_unrolled)
+@eval function my_unrolled_loop(x)
+    $(instantiate(unroll(l, :x, 4)))
+end
 ```
 
 This causes all loops within `l` that use the index variable `x` to be unrolled by a factor of `4`.
@@ -48,18 +44,18 @@ l = @looper for x in 1:size(touchstone, 1)
     end
 end
 
-lc = unroll(tile(l, :x, :y, 4, 4), :y_inner, 4)
-func = instantiate(lc; verbose=true)
+function big_daddy(touchstone)
+    touch_count = 0
+    $(instantiate(unroll(tile(l, :x, :y, 4, 4), :y_inner, 4); verbose=true))
+    return touchstone
+end
 ```
 
 This makes use of a few things; it demonstrats that you can have arbitrarily-nested `for` loops with a single `@looper` macro, it shows that you can compose loop transformations (such as a `tile()` followed by an `unroll()`, using the implicitly-created `y_inner` loop index) and it shows that there is a `verbose` keyword argument to `instantiate()` that lets you inspect the generated Julia code before it gets handed off to LLVM.  Running this instantiated code is similar to all previous examples:
 
 ```julia
 using Test
-touchstone = zeros(Int64, 5, 5)
-func(touchstone=touchstone, touch_count=0)
-
-@test touchstone == [
+@test big_daddy(zeros(Int64, 5, 5)) == [
     0   1   2   3  16;
     4   5   6   7  17;
     8   9  10  11  18;
