@@ -1,7 +1,7 @@
 module Looper
-export @looper, Loop, instantiate, unroll, tile, transpose
+export @looper, Loop, instantiate, unroll, split, tile, transpose
 
-import Base: replace, transpose, ==
+import Base: replace, transpose, ==, split
 using MacroTools
 import MacroTools: postwalk, prewalk, walk
 
@@ -46,6 +46,50 @@ function build_loops(l::Loop)
         for $(l.idx) in $(l.range)
             $(build_loops(l.body))
         end
+    end
+end
+
+# Find all loops that match a given index
+function find_loops(l, idx::Symbol)
+    loops = []
+    postwalk(l -> begin
+        if isa(l, Loop) && l.idx == idx
+            push!(loops, l)
+        end
+        return l
+    end, l)
+    return loops
+end
+
+# Remove all loops that match a given index
+function kill_loops(l, idx::Symbol)
+    return postwalk(l -> begin
+        if isa(l, Loop) && l.idx == idx
+            return nothing
+        end
+        return l
+    end, l)
+end
+
+function find_outer_inner_idx(l, idx1::Symbol, idx2::Symbol)
+    # Figure out which is outer:
+    num_idx2_in_idx1 = sum(length(find_loops(sl, idx2)) for sl in find_loops(l, idx1))
+    num_idx1_in_idx2 = sum(length(find_loops(sl, idx1)) for sl in find_loops(l, idx2))
+
+    # If neither contains the other, we can't transpose
+    if num_idx2_in_idx1 == 0 && num_idx1_in_idx2 == 0
+        throw(ArgumentError("Cannot find any nested loops with indices $(repr(idx1)) and $(repr(idx2))"))
+    end
+    # If we have an (x -> y -> x) situation (why on earth would you even do that)
+    # then give up now because we'll break badly.
+    if num_idx2_in_idx1 != 0 && num_idx1_in_idx2 != 0
+        throw(ArgumentError("Cannot separate mutually contained indices!"))
+    end
+
+    if num_idx1_in_idx2 != 0
+        return idx2, idx1
+    else
+        return idx1, idx2
     end
 end
 
@@ -127,7 +171,7 @@ function instantiate(l; verbose::Bool = false, preoptimize::Bool = true)
     # Eliminate unnecessary blocks
     func_body = prewalk(e -> MacroTools.unblock(e), func_body)
     if verbose
-        @show func_body
+        display(func_body)
     end
     return func_body
 end
@@ -191,28 +235,13 @@ function lower_constant_firsts(l::Loop)
 end
 lower_constant_firsts(ls::Vector) = lower_constant_firsts.(ls)
 
+# Helper function to replace something within a block of parsed code.
+# We special-case giving it a single `Loop` to return a `Vector{Loop}`
+# so that we can actually replace the loop itself if we need to.
+replace(body, val_old, val_new) = postwalk(x -> x == val_old ? val_new : x, body)
+replace(body::Loop, val_old, val_new) = replace([body], val_old, val_new)
 
-"""
-    find_loop(l, idx::Symbol)
-
-Given a `Loop` nest, search through the loops for the first loop that has an
-index that matches the given symbol.
-"""
-function find_loop(l, idx::Symbol)
-    loop = nothing
-    postwalk(l -> begin
-        if isa(l, Loop) && l.idx == idx
-            loop = l
-        end
-        return l
-    end, l)
-    return loop
-end
-
-
-# Helper function to find an `index` within `body` and replace it with `rep`.
-# Used for things like unrolling, where we find `l.idx` and replace it with `l.idx + offset`.
-replace(body, idx, rep) = postwalk(elem -> elem == idx ? rep : elem, body)
+# shift_body is used to replace index expressions.  Very useful.
 shift_body(body, idx, offset) = replace(body, idx, :($(idx) + $(offset)))
 
 function unroll_range(u::OrdinalRange, factor::Int)
@@ -237,7 +266,8 @@ function unroll(l::Loop, idx::Symbol, factor::Int; no_tails::Bool = false)
         if (isa(l, Loop) && l.idx == idx)
             # Construct the unrolled body
             unrolled_body = [
-                replace(l.body, l.idx, :(first($(l.range)) + $(l.idx) + $(offset))) for offset in 0:(factor - 1)
+                shift_body(l.body, l.idx, :(first($(l.range)) + $(offset))) for offset in 0:(factor - 1)
+                #replace(l.body, l.idx, :(first($(l.range)) + $(l.idx) + $(offset))) for offset in 0:(factor - 1)
             ]
             
             # We replace this current Loop with two; one for the unrolled loop and
@@ -259,191 +289,134 @@ function unroll(l::Loop, idx::Symbol, factor::Int; no_tails::Bool = false)
 end
 unroll(ls::Vector, idx::Symbol, factor::Int) = unroll.(ls, idx, factor)
 
-raw"""
-Test case:
-
-using Looper
-l = @looper for x in 1:10, y in 1:10
-    println("$(x) $(y)")
-end
-z = instantiate(l; verbose=true)
-z()
-z = instantiate(unroll(l, :y, 4); verbose=true)
-z() # This should output the same thing as the first time
-z = instantiate(unroll(unroll(l, :y, 4), :x, 8); verbose=true)
-z() # same here
-"""
-
 """
     transpose(l::Loop, idx1::Symbol, idx2::Symbol)
 
-Transpose two loops, to change iteration order.
+Transpose two loops, to change iteration order.  This method only makes
+sense if one index contains the other.  Example:
+
+    Loop(:x, ..., [
+        Loop(:z, ..., [
+            Loop(:y, range1, ...),
+            Loop(:y, range2, ...),
+        ])
+    ])
+
+And we transpose(l, :x, :y) then we should end up with:
+
+    [
+        Loop(:y, range1, [
+            Loop(:z, ..., [
+                Loop(:x, ...),
+            ])
+        ]),
+        Loop(:y, range2, [
+            Loop(:z, ..., [
+                Loop(:x, ...),
+            ])
+        ]),
+    ])
 """
 function transpose(l::Loop, idx1::Symbol, idx2::Symbol)
-    # Find the loops that contain these symbols
-    loop1 = find_loop(l, idx1)
-    loop2 = find_loop(l, idx2)
-
-    if loop1 === nothing
-        throw(ArgumentError("Unable to find index variable '$idx1'"))
-    end
-    if loop2 === nothing
-        throw(ArgumentError("Unable to find index variable '$idx2'"))
-    end
-
-    # Now, swap inner loop then outer loop.
-    l = postwalk(x -> begin
-        if !isa(x, Loop)
-            return x
+    outer_idx, inner_idx = find_outer_inner_idx(l, idx1, idx2)
+    
+    # Now, let us find all inner loops contained within each outer loop
+    outer_loops = find_loops(l, outer_idx)
+    for outer_loop in outer_loops
+        # Create an outer loop for each inner loop
+        new_outer_loops = []
+        inner_loops = find_loops(outer_loop, inner_idx)
+        for inner_loop in inner_loops
+            # For each inner loop, we take its body and wrap it with
+            # a new loop that uses the outer loops body, but we also
+            # need to eliminate any other loops within this outer_loop's
+            # body that match.
+            push!(new_outer_loops, Loop(
+                inner_loop.idx,
+                inner_loop.range,
+                kill_loops(replace(outer_loop.body,
+                    inner_loop,
+                    Loop(
+                        outer_loop.idx,
+                        outer_loop.range,
+                        inner_loop.body
+                    )
+                ), inner_idx)
+            ))
         end
-        if x.idx == loop1.idx
-            return Loop(loop2.idx, loop2.range, x.body)
-        elseif x.idx == loop2.idx
-            return Loop(loop1.idx, loop1.range, x.body)
-        else
-            return x
-        end
-    end, l)
+
+        # Now replace that outer loop with these new outer loops
+        l = replace(l, outer_loop, new_outer_loops)
+    end
 
     return l
 end
 
 transpose(ls::Vector, idx1::Symbol, idx2::Symbol) = transpose.(ls, idx1, idx2)
 
-raw"""
-# Test case:
 
-using Looper
-l = @loops for x in 1:10, y in 1:10
-    println("$(x) $(y)")
-end
-z = instantiate(l)
-z()
-zt = instantiate(transpose(l, :x, :y))
-zt() # This should output transposed ordering
-"""
-
-function tile_range_outer(u::OrdinalRange, factor::Int)
+function split_range_outer(u::OrdinalRange, factor::Int)
     return (first(u) - 1):(step(u)*factor):(last(u) - factor)
 end
-function tile_range_inner(u::OrdinalRange, factor::Int)
+function split_range_inner(u::OrdinalRange, factor::Int)
     return 0:step(u):min(factor-1, last(u)-1)
 end
-function tile_range_remainder(u::OrdinalRange, factor::Int)
-    return 0:(last(u) - last(tile_range_outer(u, factor)) - factor - 1)
+function split_range_remainder(u::OrdinalRange, factor::Int)
+    return 0:(last(u) - last(split_range_outer(u, factor)) - factor - 1)
 end
 
-# Just until MacroTools gets patched...
-function inexpr(ex, x)
-    result = false
-    MacroTools.postwalk(ex) do y
-        if y == x
-            result = true
+
+"""
+    split(l::Loop, var::Symol, size::Int)
+
+Slice a loop into two nested loops, the inner of which is of size `size`.
+This is like a 1-dimensional tiling.
+"""
+function split(l::Loop, var::Symbol, size::Int)
+    return postwalk(x -> begin
+        if !isa(x, Loop)
+            return x
         end
-        return y
-    end
-    return result
+
+        # Did we find the loop we're interested in?
+        if x.idx == var
+            outer = Symbol("$(var)_outer")
+            inner = Symbol("$(var)_inner")
+
+            # If so, split; we generate two loops, each nested: A loop that
+            # contains inner/outer pairs, then a loop at the end that
+            # contains whatever extra cleanup we need to due to dividing
+            # the loop by a `size` that is not a perfect multiple.
+            body = replace(x.body, var, :($(outer) + $(inner) + first($(x.range))))
+            return [
+                Loop(outer, :(Looper.split_range_outer($(x.range), $(size))),
+                    Loop(inner, :(Looper.split_range_inner($(x.range), $(size))), body)
+                ),
+                Loop(outer, :(last(Looper.split_range_outer($(x.range), $(size))) + $(size)),
+                    Loop(inner, :(Looper.split_range_remainder($(x.range), $(size))), body)
+                ),
+            ]
+        else
+            return x
+        end
+    end, l)
 end
+split(ls::Vector, var::Symbol, size::Int) = split.(ls, var, size)
+
 
 """
     tile(l::Loop, x_var::Symbol, y_var::Symbol, x_size::Int, y_size::Int)
 
-Tile two nested loops in tiles of size `x_size` and `y_size`.  Note that the `y`
-loop _must_ be contained within the `x` loop.  (E.g. `x` must be the outer loop).
+Tile two nested loops in tiles of size `x_size` and `y_size`.
 """
 function tile(l::Loop, x_var::Symbol, y_var::Symbol, x_size::Int, y_size::Int)
-    # A tiled loop contains four nested loops, an inner and outer loop for the x and y variables
-    x_outer = Symbol("$(x_var)_outer")
-    x_inner = Symbol("$(x_var)_inner")
-    y_outer = Symbol("$(y_var)_outer")
-    y_inner = Symbol("$(y_var)_inner")
+    outer_idx, inner_idx = find_outer_inner_idx(l, x_var, y_var)
+    outer_size, inner_size = (x_var == outer_idx) ? (x_size, y_size) : (y_size, x_size)
 
-    # Find the loops
-    x_loop = find_loop(l, x_var)
-    y_loop = find_loop(l, y_var)
-    
-    # Enforce x as the outer loop
-    if inexpr(y_loop, x_loop)
-        l = transpose(l, :x, :y)
-        x_loop = find_loop(l, x_var)
-        y_loop = find_loop(l, y_var)
-    end
-
-    # We always make y as the inner loop, so we always use its body.
-    body = y_loop.body
-
-    # Rewrite index references in the body to use our tiled index calculation system
-    body = replace(body, x_var, :($(x_outer) + $(x_inner) + first($(x_loop.range))))
-    body = replace(body, y_var, :($(y_outer) + $(y_inner) + first($(y_loop.range))))
-
-    return [
-        # Loop over all columns by tile
-        Loop(x_outer, :(Looper.tile_range_outer($(x_loop.range), $(x_size))),
-            [
-                # Loop over all tiles within this column
-                Loop(y_outer, :(Looper.tile_range_outer($(y_loop.range), $(y_size))),
-                    # Fill out every element within this tile
-                    Loop(x_inner, :(Looper.tile_range_inner($(x_loop.range), $(x_size))),
-                        Loop(y_inner, :(Looper.tile_range_inner($(y_loop.range), $(y_size))),
-                            # This is, ideally, the hottest part of the code
-                            body,
-                        )
-                    )
-                ),
-                # Having finished all full tiles within a "column", we must next 
-                # compute the final (partial) tile within this column.  This also
-                # means we must constrain the inner loop ranges to compute a partial
-                # tile, rather than a full tile by using `tile_range_remainder()`
-                Loop(y_outer, :(last(Looper.tile_range_outer($(y_loop.range), $(y_size))) + $(y_size)),
-                    Loop(x_inner, :(Looper.tile_range_inner($(x_loop.range), $(x_size))),
-                        Loop(y_inner, :(Looper.tile_range_remainder($(y_loop.range), $(y_size))),
-                            body,
-                        )
-                    )
-                )
-            ]
-        ),
-        # Having finished all full columns, we must next compute the final (partial)
-        # tiles all along the last partial column.
-        Loop(x_outer, :(last(Looper.tile_range_outer($(x_loop.range), $(x_size))) + $(x_size)),
-            Loop(y_outer, :(Looper.tile_range_outer($(y_loop.range), $(y_size))),
-                Loop(x_inner, :(Looper.tile_range_remainder($(x_loop.range), $(x_size))),
-                    Loop(y_inner, :(Looper.tile_range_inner($(y_loop.range), $(y_size))),
-                        body,
-                    )
-                )
-            )
-        ),
-        # And finally, the black-sheep tile which is restricted in both x and y
-        Loop(x_outer, :(last(Looper.tile_range_outer($(x_loop.range), $(x_size))) + $(x_size)),
-            Loop(y_outer, :(last(Looper.tile_range_outer($(y_loop.range), $(y_size))) + $(y_size)),
-                Loop(x_inner, :(Looper.tile_range_remainder($(x_loop.range), $(x_size))),
-                    Loop(y_inner, :(Looper.tile_range_remainder($(y_loop.range), $(y_size))),
-                        body,
-                    )
-                )
-            )
-        ),
-    ]
+    l = split(split(l, outer_idx, outer_size), inner_idx, inner_size)
+    return transpose(l, Symbol("$(outer_idx)_inner"), Symbol("$(inner_idx)_outer"))
 end
 tile(l::Vector, x_var::Symbol, y_var::Symbol, x_size::Int, y_size::Int) =
     tile.(l, x_var, y_var, x_size, y_size)
-
-raw"""
-# Test case:
-
-using Looper
-l = @looper for x in 1:10, y in 1:10
-    println("$(x) $(y)")
-end
-z = instantiate(l)
-z()
-
-ltiled = tile(l, :x, :y, 4, 4)
-#ztiled = instantiate(ltiled; verbose=true)
-#ztiled() # This should output tiled ordering
-ztiled_unrolled = instantiate(unroll(ltiled, :y_inner, 4); verbose=true)
-ztiled_unrolled() # Oh baby can it be?!
-"""
 
 end

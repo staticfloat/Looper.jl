@@ -17,16 +17,16 @@ using Looper, Test
     @test collect(Looper.unroll_range_tail(2:10, 4)) == [10]
 
     # Tile range tests
-    @test collect(Looper.tile_range_outer(1:4, 4)) == [0]
-    @test collect(Looper.tile_range_outer(1:8, 4)) == [0, 4]
-    @test collect(Looper.tile_range_outer(1:10, 4)) == [0, 4]
-    @test collect(Looper.tile_range_inner(1:3, 4)) == [0, 1, 2]
-    @test collect(Looper.tile_range_inner(1:4, 4)) == [0, 1, 2, 3]
-    @test collect(Looper.tile_range_inner(1:10, 4)) == [0, 1, 2, 3]
+    @test collect(Looper.split_range_outer(1:4, 4)) == [0]
+    @test collect(Looper.split_range_outer(1:8, 4)) == [0, 4]
+    @test collect(Looper.split_range_outer(1:10, 4)) == [0, 4]
+    @test collect(Looper.split_range_inner(1:3, 4)) == [0, 1, 2]
+    @test collect(Looper.split_range_inner(1:4, 4)) == [0, 1, 2, 3]
+    @test collect(Looper.split_range_inner(1:10, 4)) == [0, 1, 2, 3]
 
-    @test collect(Looper.tile_range_remainder(1:4, 4)) == []
-    @test collect(Looper.tile_range_remainder(1:5, 4)) == [0]
-    @test collect(Looper.tile_range_remainder(1:10, 4)) == [0, 1]
+    @test collect(Looper.split_range_remainder(1:4, 4)) == []
+    @test collect(Looper.split_range_remainder(1:5, 4)) == [0]
+    @test collect(Looper.split_range_remainder(1:10, 4)) == [0, 1]
 end
 
 # Test loop capture macro
@@ -169,6 +169,29 @@ end
     @test unrolled6() == sum(1:6)
 end
 
+@testset "Loop Splitting" begin
+    l = @looper for x in 1:10
+        x_out += x
+    end
+
+    # Split `l` by a factor of 4 along `x`
+    l_split = split(l, :x, 4)
+
+    # Test that this lowers to three loops; a nested pair and a cleanup
+    @test length(l_split) == 2
+    @test length(l_split[1].body) == 1
+    @test length(l_split[1].body[1].body) == 1
+    @test length(l_split[2].body) == 1
+    @test length(l_split[2].body[1].body) == 1
+
+    @eval function splitted()
+        x_out = 0
+        $(instantiate(l_split))
+        return x_out
+    end
+    @test splitted() == sum(1:10)
+end
+
 @testset "Loop Transposition" begin
     @testset "Simple Transposition" begin
         l = @looper for x in 1:10
@@ -243,10 +266,12 @@ end
        20  21  22  23  24;
     ]
 
-    # Tile this in y/x in blocks of 2
+    # Tile this in y/x in blocks of 2.  Note that it auto-
+    # matically figures out the outer loop index, so we just
+    # transpose it first to make the tiling go the other way.
     @eval function tile_yx22(touchstone)
         touch_count = 0
-        $(instantiate(tile(l, :y, :x, 2, 2)))
+        $(instantiate(tile(transpose(l, :x, :y), :x, :y, 2, 2)))
         return touchstone
     end
     @test tile_yx22(zeros(Int64, 5, 5)) == tile_xy22(zeros(Int64, 5, 5))'
@@ -276,12 +301,8 @@ end
     end
 
     lc = unroll(tile(l, :x, :y, 4, 4), :y_inner, 4)
-
-    # Three loops; big daddy, final edge, and final corner
-    @test length(lc) == 3
-    @test length(lc[1].body) == 2
     # Test we are fully unrolled
-    @test length(lc[1].body[1].body[1].body[1].body) == 4
+    @test length(lc[1][1].body[1].body[1].body[1].body) == 4
 
     @eval function big_daddy(touchstone)
         touch_count = 0
